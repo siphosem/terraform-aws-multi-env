@@ -1,0 +1,18 @@
+# Checks deliberately skipped for this lab, each with a reason.
+skip-check:
+  - CKV_AWS_2    # ALB listener is HTTP: no domain/ACM certificate in a lab
+  - CKV_AWS_103  # TLS policy: same reason as above
+  - CKV2_AWS_20  # HTTP->HTTPS redirect: same reason as above
+  - CKV_AWS_91   # ALB access logs: would need an extra S3 bucket and cost
+  - CKV2_AWS_28  # WAF on public ALB: out of scope for a lab
+  - CKV_AWS_150  # ALB deletion protection: environments are torn down often
+  - CKV_AWS_158  # CloudWatch log group KMS CMK: AWS-managed encryption is fine here
+  - CKV_AWS_338  # Log retention >= 1 year: 7 days keeps costs down
+  - CKV_AWS_260  # Port 80 open to the internet: it's the public ALB, by design
+  - CKV2_AWS_12  # Default SG restrict-all: default SG is unused
+  - CKV_AWS_378  # ALB -> instance traffic is HTTP inside the VPC; TLS would terminate at the ALB
+  - CKV_AWS_394  # AZ list is sliced to az_count, so new AZs don't change the result
+  - CKV_AWS_18   # State bucket access logs: would need a second logging bucket
+  - CKV_AWS_144  # State bucket cross-region replication: overkill for a lab
+  - CKV_AWS_145  # State bucket SSE-S3 instead of a KMS CMK: no extra key cost
+  - CKV2_AWS_62  # State bucket event notifications: nothing consumes them

@@ -1,0 +1,146 @@
+# Terraform CI/CD on GitHub Actions.
+#   Pull request : fmt, validate, TFLint, Checkov, then a plan for dev (shown in the run summary)
+#   Push to main : same checks -> apply dev -> apply prod (prod waits for a reviewer's approval)
+#   Manual       : "Run workflow" -> destroy dev or prod
+# AWS access uses GitHub OIDC; no keys are stored. Repository variables needed
+# (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_ROLE_ARN    - output ci_role_arn from bootstrap/
+#   TF_STATE_BUCKET - output state_bucket from bootstrap/
+# AWS jobs skip themselves until AWS_ROLE_ARN is set, so the checks still run on a fresh repo.
+
+name: Terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: "Environment to destroy"
+        type: choice
+        options: [dev, prod]
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  checks:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+      - name: Validate
+        run: |
+          terraform init -backend=false
+          terraform validate
+          terraform -chdir=bootstrap init -backend=false
+          terraform -chdir=bootstrap validate
+      - uses: terraform-linters/setup-tflint@v6
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          config_file: .checkov.yaml
+
+  plan-pr:
+    if: github.event_name == 'pull_request' && vars.AWS_ROLE_ARN != ''
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Plan dev
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform-aws-multi-env/dev.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          terraform plan -var-file=environments/dev.tfvars -no-color -lock=false | tee plan.txt
+          {
+            echo "### Terraform plan: dev"
+            echo '```'
+            tail -n 60 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: github.event_name == 'push' && vars.AWS_ROLE_ARN != ''
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # dev first, then prod
+      matrix:
+        environment: [dev, prod]
+    environment: ${{ matrix.environment }} # add required reviewers to "prod" in repo settings
+    concurrency: terraform-${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform-aws-multi-env/${{ matrix.environment }}.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+      - name: Plan
+        run: terraform plan -var-file=environments/${{ matrix.environment }}.tfvars -out=plan.tfplan
+      - name: Apply the reviewed plan
+        run: terraform apply plan.tfplan
+      - name: Summary
+        run: |
+          echo "### ${{ matrix.environment }}: $(terraform output -raw url)" >> "$GITHUB_STEP_SUMMARY"
+
+  destroy:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.destroy }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Destroy
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform-aws-multi-env/${{ inputs.destroy }}.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -auto-approve -var-file=environments/${{ inputs.destroy }}.tfvars
